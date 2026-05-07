@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, sys, json, re, base64, io, threading, concurrent.futures
+import os, sys, json, re, base64, io, threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,29 +28,33 @@ def save_cfg(c):
     except: pass
 
 def check_one(args):
-    pdf_path, idx, api_url, api_key, model, prompt = args
+    pdf_path, idx, api_url, api_key, model, prompt, cancel_event = args
+    if cancel_event.is_set():
+        return idx + 1, None
     doc = fitz.open(pdf_path)
     page = doc[idx]
     pix = page.get_pixmap(matrix=fitz.Matrix(0.75, 0.75))
     img_bytes = pix.tobytes("png")
     doc.close()
+    if cancel_event.is_set():
+        return idx + 1, None
     b64 = base64.standard_b64encode(img_bytes).decode()
     r = requests.post(api_url,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={"model": model, "messages": [{"role":"user","content":[
             {"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}"}},
             {"type":"text","text":prompt}
-        ]}], "max_tokens":200}, timeout=90)
+        ]}], "max_tokens":300}, timeout=90)
     text = r.json()["choices"][0]["message"]["content"]
     m = re.search(r"\{[^}]+\}", text)
-    data = json.loads(m.group()) if m else {"机组长":"解析失败","质量员":"解析失败"}
+    data = json.loads(m.group()) if m else {"类型":"未知","质量员":"解析失败","机组长":"解析失败","监理工程师":"解析失败"}
     return idx + 1, data
 
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("焊接记录签字校核工具")
-        self.root.geometry("680x560")
+        self.root.geometry("700x560")
         self.root.configure(bg="#f8f9fa")
         self.root.resizable(False, False)
         self.running = False
@@ -180,9 +184,12 @@ class App:
     def _run(self, pdf, out, url, key):
         model = self.v_model.get().strip()
         workers = self.v_workers.get()
-        prompt = ('这是一张焊接记录表扫描页。表格底部有"机组长"和"质量员"两个签字位。'
-                  '请检查这两个签字位是否有手写笔迹，很淡的也算有，完全空白才算无。'
-                  '回答JSON：{"机组长":"有/无","质量员":"有/无"}')
+        prompt = ('这是一张焊接记录表扫描页。请先判断表格类型：'
+                  '如果是"管道组对焊接记录"，检查底部"机组长"和"质量员"签字位；'
+                  '如果是"焊口返修记录"，检查底部"质量员"和"监理工程师"签字位。'
+                  '很淡的笔迹也算有，完全空白才算无。'
+                  '回答JSON格式：{"类型":"组对/返修","质量员":"有/无","机组长":"有/无","监理工程师":"有/无"}'
+                  '组对记录只需填质量员和机组长，返修记录只需填质量员和监理工程师，不涉及的填"无"。')
         try:
             doc = fitz.open(pdf)
             total = doc.page_count
@@ -195,49 +202,62 @@ class App:
         self.root.after(0, lambda: self.pbar.configure(maximum=total, value=0))
         self.root.after(0, self._wlog, f"共 {total} 页，开始检测...")
         self.results = {}
-        miss_jz, miss_zl, errs = [], [], []
+        miss_zl, miss_jz, miss_jl, errs = [], [], [], []
         done = 0
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(check_one,(pdf,i,url,key,model,prompt)):i for i in range(total)}
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            futs = {pool.submit(check_one,(pdf,i,url,key,model,prompt,self.cancel)):i for i in range(total)}
             for f in as_completed(futs):
                 if self.cancel.is_set():
+                    for ff in futs:
+                        ff.cancel()
                     break
                 done += 1
                 try:
                     pn, d = f.result()
+                    if d is None:
+                        continue
                     self.results[pn] = d
-                    jz = d.get("机组长","?"); zl = d.get("质量员","?")
-                    if jz=="无": miss_jz.append(pn)
-                    if zl=="无": miss_zl.append(pn)
-                    if jz=="无" or zl=="无":
-                        self.root.after(0, self._wlog, f"  第{pn}页: 机组长={jz} 质量员={zl}  <---")
+                    tp = d.get("类型","?"); zl = d.get("质量员","?"); jz = d.get("机组长","?"); jl = d.get("监理工程师","?")
+                    missing = []
+                    if tp == "组对":
+                        if jz == "无": miss_jz.append(pn); missing.append(f"机组长={jz}")
+                        if zl == "无": miss_zl.append(pn); missing.append(f"质量员={zl}")
+                    elif tp == "返修":
+                        if jl == "无": miss_jl.append(pn); missing.append(f"监理工程师={jl}")
+                        if zl == "无": miss_zl.append(pn); missing.append(f"质量员={zl}")
+                    if missing:
+                        self.root.after(0, self._wlog, f"  第{pn}页 [{tp}]: {' '.join(missing)}  <---")
                     if done%50==0:
                         self.root.after(0, self._wlog, f"  进度 {done}/{total}")
                 except Exception as e:
                     pn = futs[f]+1
-                    self.results[pn] = {"机组长":"错误","质量员":"错误"}
+                    self.results[pn] = {"类型":"错误","质量员":"错误","机组长":"错误","监理工程师":"错误"}
                     errs.append(pn)
                     self.root.after(0, self._wlog, f"  第{pn}页出错: {str(e)[:50]}")
                 self.root.after(0, lambda d=done,t=total: (self.pbar.configure(value=d), self.v_prog.set(f"{d}/{t}")))
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         if self.cancel.is_set():
             self.root.after(0, self._wlog, f"\n  已取消，已完成 {done}/{total} 页\n")
             self.root.after(0, self._reset)
             self.running = False
             return
         xlsx = os.path.join(out, "签字校核结果.xlsx")
-        self._xlsx(xlsx, miss_jz, miss_zl)
-        miss_jz.sort(); miss_zl.sort()
+        self._xlsx(xlsx, miss_zl, miss_jz, miss_jl)
+        miss_zl.sort(); miss_jz.sort(); miss_jl.sort()
         s = (f"\n================================\n"
              f"  校核完成\n"
              f"  总页数: {total}\n"
-             f"  机组长缺签: {len(miss_jz)}页  {miss_jz or ''}\n"
              f"  质量员缺签: {len(miss_zl)}页  {miss_zl or ''}\n"
+             f"  机组长缺签: {len(miss_jz)}页  {miss_jz or ''}\n"
+             f"  监理工程师缺签: {len(miss_jl)}页  {miss_jl or ''}\n"
              f"  错误: {len(errs)}页\n"
              f"  Excel: {xlsx}\n")
         self.root.after(0, self._wlog, s)
         self.root.after(0, self._reset)
         self.root.after(0, lambda: messagebox.showinfo("完成",
-            f"机组长缺签: {len(miss_jz)}页\n质量员缺签: {len(miss_zl)}页"))
+            f"质量员缺签: {len(miss_zl)}页\n机组长缺签: {len(miss_jz)}页\n监理工程师缺签: {len(miss_jl)}页"))
         self.running = False
 
     def _reset(self):
@@ -245,7 +265,7 @@ class App:
         self.btn_cancel.pack_forget()
         self.btn_cancel.configure(state="normal")
 
-    def _xlsx(self, path, miss_jz, miss_zl):
+    def _xlsx(self, path, miss_zl, miss_jz, miss_jl):
         wb = Workbook(); ws = wb.active; ws.title = "签字校核"
         hf = Font(bold=True, size=13, color="FFFFFF")
         hfl = PatternFill(start_color="4361ee", end_color="4361ee", fill_type="solid")
@@ -253,17 +273,19 @@ class App:
         grn = PatternFill(start_color="c8f7c5", end_color="c8f7c5", fill_type="solid")
         bdr = Border(Side("thin"),Side("thin"),Side("thin"),Side("thin"))
         ca = Alignment(horizontal="center")
-        for i,h in enumerate(["页码","机组长","质量员"],1):
+        for i,h in enumerate(["页码","类型","质量员","机组长","监理工程师"],1):
             cl = ws.cell(row=1,column=i,value=h); cl.font=hf; cl.fill=hfl; cl.alignment=ca; cl.border=bdr
         for pn in range(1, self.total+1):
             r = self.results.get(pn,{})
-            jz = r.get("机组长","?"); zl = r.get("质量员","?")
-            ws.cell(row=pn+1,column=1,value=pn).border=bdr
-            ws.cell(row=pn+1,column=1).alignment=ca
-            c2 = ws.cell(row=pn+1,column=2,value=jz); c2.border=bdr; c2.alignment=ca; c2.fill=red if jz=="无" else grn
+            tp = r.get("类型","?"); zl = r.get("质量员","?"); jz = r.get("机组长","?"); jl = r.get("监理工程师","?")
+            ws.cell(row=pn+1,column=1,value=pn).border=bdr; ws.cell(row=pn+1,column=1).alignment=ca
+            c2 = ws.cell(row=pn+1,column=2,value=tp); c2.border=bdr; c2.alignment=ca
             c3 = ws.cell(row=pn+1,column=3,value=zl); c3.border=bdr; c3.alignment=ca; c3.fill=red if zl=="无" else grn
-        ws.column_dimensions["A"].width=8; ws.column_dimensions["B"].width=14; ws.column_dimensions["C"].width=14
-        ws.freeze_panes="A2"; ws.auto_filter.ref=f"A1:C{self.total+1}"
+            c4 = ws.cell(row=pn+1,column=4,value=jz); c4.border=bdr; c4.alignment=ca; c4.fill=red if tp=="组对" and jz=="无" else (grn if tp=="组对" else PatternFill())
+            c5 = ws.cell(row=pn+1,column=5,value=jl); c5.border=bdr; c5.alignment=ca; c5.fill=red if tp=="返修" and jl=="无" else (grn if tp=="返修" else PatternFill())
+        ws.column_dimensions["A"].width=8; ws.column_dimensions["B"].width=10
+        ws.column_dimensions["C"].width=12; ws.column_dimensions["D"].width=12; ws.column_dimensions["E"].width=16
+        ws.freeze_panes="A2"; ws.auto_filter.ref=f"A1:E{self.total+1}"
         wb.save(path)
 
 def main():
