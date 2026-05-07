@@ -44,7 +44,7 @@ def check_one(args):
         json={"model": model, "messages": [{"role":"user","content":[
             {"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}"}},
             {"type":"text","text":prompt}
-        ]}], "max_tokens":300}, timeout=90)
+        ]}]}, timeout=90)
     text = r.json()["choices"][0]["message"]["content"]
     m = re.search(r"\{[^}]+\}", text)
     data = json.loads(m.group()) if m else {"类型":"未知","质量员":"解析失败","机组长":"解析失败","监理工程师":"解析失败"}
@@ -117,7 +117,7 @@ class App:
         self.v_key = tk.StringVar(value=cfg.get("key",""))
         ttk.Entry(f2, textvariable=self.v_key, width=55, show="*").grid(row=1, column=1, columnspan=3, padx=4, pady=(6,0))
         tk.Label(f2, text="模型：", font=CN, bg=BG).grid(row=2, column=0, sticky="w", pady=(6,0))
-        self.v_model = tk.StringVar(value=cfg.get("model","qwen-vl-turbo"))
+        self.v_model = tk.StringVar(value=cfg.get("model","qwen-vl-plus"))
         ttk.Entry(f2, textvariable=self.v_model, width=22).grid(row=2, column=1, sticky="w", padx=4, pady=(6,0))
         tk.Label(f2, text="并发：", font=CN, bg=BG).grid(row=2, column=2, sticky="e", pady=(6,0))
         self.v_workers = tk.IntVar(value=cfg.get("workers",5))
@@ -184,12 +184,22 @@ class App:
     def _run(self, pdf, out, url, key):
         model = self.v_model.get().strip()
         workers = self.v_workers.get()
-        prompt = ('这是一张焊接记录表扫描页。请先判断表格类型：'
-                  '如果是"管道组对焊接记录"，检查底部"机组长"和"质量员"签字位；'
-                  '如果是"焊口返修记录"，检查底部"质量员"和"监理工程师"签字位。'
-                  '很淡的笔迹也算有，完全空白才算无。'
-                  '回答JSON格式：{"类型":"组对/返修","质量员":"有/无","机组长":"有/无","监理工程师":"有/无"}'
-                  '组对记录只需填质量员和机组长，返修记录只需填质量员和监理工程师，不涉及的填"无"。')
+        prompt = ('这是一张焊接记录表扫描页。请严格按以下步骤操作：\n\n'
+                  '第一步：判断表格类型。\n'
+                  '如果标题包含"管道组对焊接记录"或"组对"，类型为"组对"；\n'
+                  '如果标题包含"焊口返修"或"返修"，类型为"返修"。\n\n'
+                  '第二步：仔细检查每个签字位的实际情况。\n'
+                  '"有"的标准：必须能看到手写人名的笔画结构，是有人用笔写出来的字。\n'
+                  '"无"的情况（以下全部算无）：\n'
+                  '  - 空白区域，什么都没有\n'
+                  '  - 只有一条横线（那是提示线，不是签字）\n'
+                  '  - 只有印章/公章/骑缝章（印章不是手写签名）\n'
+                  '  - 只有打印文字\n'
+                  '  - 模糊的灰印、水印、扫描噪点\n\n'
+                  '第三步：输出JSON。\n'
+                  '格式：{"类型":"组对/返修","质量员":"有/无","机组长":"有/无","监理工程师":"有/无"}\n'
+                  '组对记录只需填质量员和机组长，返修记录只需填质量员和监理工程师，不涉及的填"无"。\n'
+                  '如果不确定，填"无"。')
         try:
             doc = fitz.open(pdf)
             total = doc.page_count
